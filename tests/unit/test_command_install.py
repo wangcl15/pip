@@ -1,17 +1,13 @@
 import errno
+import sys
 from unittest import mock
 
 import pytest
-from pip._vendor.packaging.requirements import Requirement
+
+from pip._vendor.requests.exceptions import InvalidProxyURL
 
 from pip._internal.commands import install
-from pip._internal.commands.install import (
-    create_os_error_message,
-    decide_user_install,
-    reject_location_related_install_options,
-)
-from pip._internal.exceptions import CommandError
-from pip._internal.req.req_install import InstallRequirement
+from pip._internal.commands.install import create_os_error_message, decide_user_install
 
 
 class TestDecideUserInstall:
@@ -46,37 +42,6 @@ class TestDecideUserInstall:
             lambda **kw: site_packages_writable,
         )
         assert decide_user_install(use_user_site=None) is result
-
-
-def test_rejection_for_pip_install_options() -> None:
-    install_options = ["--prefix=/hello"]
-    with pytest.raises(CommandError) as e:
-        reject_location_related_install_options([], install_options)
-
-    assert "['--prefix'] from command line" in str(e.value)
-
-
-def test_rejection_for_location_requirement_options() -> None:
-    bad_named_req_options = ["--home=/wow"]
-    bad_named_req = InstallRequirement(
-        Requirement("hello"), "requirements.txt", install_options=bad_named_req_options
-    )
-
-    bad_unnamed_req_options = ["--install-lib=/lib"]
-    bad_unnamed_req = InstallRequirement(
-        None, "requirements2.txt", install_options=bad_unnamed_req_options
-    )
-
-    with pytest.raises(CommandError) as e:
-        reject_location_related_install_options(
-            [bad_named_req, bad_unnamed_req], options=[]
-        )
-
-    assert (
-        "['--install-lib'] from <InstallRequirement> (from requirements2.txt)"
-        in str(e.value)
-    )
-    assert "['--home'] from hello (from requirements.txt)" in str(e.value)
 
 
 @pytest.mark.parametrize(
@@ -145,6 +110,66 @@ def test_rejection_for_location_requirement_options() -> None:
             "Could not install packages due to an OSError: [Errno 13] No"
             " file permission\nConsider using the `--user` option or check the"
             " permissions.\n",
+        ),
+        # Testing custom InvalidProxyURL with help message
+        #  show_traceback = True, using_user_site = True
+        (
+            InvalidProxyURL(),
+            True,
+            True,
+            "Could not install packages due to an OSError.\n"
+            "Consider checking your local proxy configuration"
+            ' with "pip config debug".\n',
+        ),
+        # Testing both long path error (ENOENT)
+        # and long file/folder name error (EINVAL) on Windows
+        pytest.param(
+            OSError(errno.ENOENT, "No such file or directory", f"C:{'/a'*261}"),
+            False,
+            False,
+            "Could not install packages due to an OSError: "
+            f"[Errno 2] No such file or directory: 'C:{'/a'*261}'\n"
+            "HINT: This error might have occurred since "
+            "this system does not have Windows Long Path "
+            "support enabled. You can find information on "
+            "how to enable this at "
+            "https://pip.pypa.io/warnings/enable-long-paths\n",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="Windows-specific filename length test"
+            ),
+        ),
+        pytest.param(
+            OSError(errno.EINVAL, "No such file or directory", f"C:/{'a'*256}"),
+            False,
+            False,
+            "Could not install packages due to an OSError: "
+            f"[Errno 22] No such file or directory: 'C:/{'a'*256}'\n"
+            "HINT: This error might be caused by a file or folder name exceeding "
+            "255 characters, which is a Windows limitation even if long paths "
+            "are enabled.\n",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="Windows-specific filename length test"
+            ),
+        ),
+        pytest.param(
+            OSError(
+                errno.EINVAL, "No such file or directory", f"C:{'/a'*261}/{'b'*256}"
+            ),
+            False,
+            False,
+            "Could not install packages due to an OSError: "
+            f"[Errno 22] No such file or directory: 'C:{'/a' * 261}/{'b' * 256}'\n"
+            "HINT: This error might be caused by a file or folder name exceeding "
+            "255 characters, which is a Windows limitation even if long paths "
+            "are enabled.\n "
+            "HINT: This error might have occurred since "
+            "this system does not have Windows Long Path "
+            "support enabled. You can find information on "
+            "how to enable this at "
+            "https://pip.pypa.io/warnings/enable-long-paths\n",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="Windows-specific filename length test"
+            ),
         ),
     ],
 )

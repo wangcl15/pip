@@ -17,10 +17,9 @@ When considering use cases, please bear in mind that
   other use cases), this format is *not* meant to be a lock file format as such;
 - there is no plan for pip to accept an installation report as input for the `install`,
   `download` or `wheel` commands;
-- the `--report` option and this format is intended to become a supported pip feature
-  (when the format is stabilized to version 1);
-- it is however *not* a PyPA interoperability standard and as such its evolution will be
-  governed by the pip processes and not the PyPA standardization processes.
+- while the `--report` option and this format is a supported pip feature,
+  it is *not* a PyPA interoperability standard and as such its evolution is governed by
+  the pip processes and not the PyPA standardization processes.
 ```
 
 ## Specification
@@ -36,7 +35,7 @@ The report is a JSON object with the following properties:
 
 - `pip_version`: a string with the version of pip used to produce the report.
 
-- `install`: an array of [InstallationReportItem](InstallationReportItem) representing
+- `install`: an array of [`InstallationReportItem`](InstallationReportItem) representing
   the distribution packages (to be) installed.
 
 - `environment`: an object describing the environment where the installation report was
@@ -57,10 +56,14 @@ package with the following properties:
   URL reference. `false` if the requirements was provided as a name and version
   specifier.
 
+- `is_yanked`: `true` if the requirement was yanked from the index, but was still
+  selected by pip conform to [PEP 592](https://peps.python.org/pep-0592/#installers).
+
 - `download_info`: Information about the artifact (to be) downloaded for installation,
-  using the [direct
-  URL](https://packaging.python.org/en/latest/specifications/direct-url/) data
-  structure. When `is_direct` is `true`, this field is the same as the `direct_url.json`
+  using the [direct URL data
+  structure](https://packaging.python.org/en/latest/specifications/direct-url-data-structure/).
+  When `is_direct` is `true`, this field is the same as the
+  [`direct_url.json`](https://packaging.python.org/en/latest/specifications/direct-url)
   metadata, otherwise it represents the URL of the artifact obtained from the index or
   `--find-links`.
 
@@ -106,6 +109,7 @@ will produce an output similar to this (metadata abriged for brevity):
         }
       },
       "is_direct": false,
+      "is_yanked": false,
       "requested": true,
       "metadata": {
         "name": "pydantic",
@@ -133,6 +137,7 @@ will produce an output similar to this (metadata abriged for brevity):
         }
       },
       "is_direct": true,
+      "is_yanked": false,
       "requested": true,
       "metadata": {
         "name": "packaging",

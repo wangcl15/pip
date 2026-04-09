@@ -21,23 +21,27 @@ def _assert_requested_absent(
     assert requested not in result.files_created
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_basic(script: PipTestEnvironment, data: TestData) -> None:
     result = script.pip(
-        "install", "--no-index", "-f", data.find_links, "require_simple"
+        "install",
+        "--no-build-isolation",
+        "--no-index",
+        "-f",
+        data.find_links,
+        "require_simple",
     )
     _assert_requested_present(script, result, "require_simple", "1.0")
     # dependency is not REQUESTED
     _assert_requested_absent(script, result, "simple", "3.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_requirements(
     script: PipTestEnvironment, data: TestData
 ) -> None:
     script.scratch_path.joinpath("requirements.txt").write_text("require_simple\n")
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-f",
         data.find_links,
@@ -48,7 +52,6 @@ def test_install_requested_requirements(
     _assert_requested_absent(script, result, "simple", "3.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_dep_in_requirements(
     script: PipTestEnvironment, data: TestData
 ) -> None:
@@ -57,6 +60,7 @@ def test_install_requested_dep_in_requirements(
     )
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-f",
         data.find_links,
@@ -68,7 +72,6 @@ def test_install_requested_dep_in_requirements(
     _assert_requested_present(script, result, "simple", "2.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_reqs_and_constraints(
     script: PipTestEnvironment, data: TestData
 ) -> None:
@@ -76,6 +79,7 @@ def test_install_requested_reqs_and_constraints(
     script.scratch_path.joinpath("constraints.txt").write_text("simple<3\n")
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-f",
         data.find_links,
@@ -89,7 +93,6 @@ def test_install_requested_reqs_and_constraints(
     _assert_requested_absent(script, result, "simple", "2.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_in_reqs_and_constraints(
     script: PipTestEnvironment, data: TestData
 ) -> None:
@@ -99,6 +102,7 @@ def test_install_requested_in_reqs_and_constraints(
     script.scratch_path.joinpath("constraints.txt").write_text("simple<3\n")
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-f",
         data.find_links,
@@ -112,13 +116,13 @@ def test_install_requested_in_reqs_and_constraints(
     _assert_requested_present(script, result, "simple", "2.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 def test_install_requested_from_cli_with_constraint(
     script: PipTestEnvironment, data: TestData
 ) -> None:
     script.scratch_path.joinpath("constraints.txt").write_text("simple<3\n")
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-f",
         data.find_links,
@@ -130,7 +134,6 @@ def test_install_requested_from_cli_with_constraint(
     _assert_requested_present(script, result, "simple", "2.0")
 
 
-@pytest.mark.usefixtures("with_wheel")
 @pytest.mark.network
 def test_install_requested_from_cli_with_url_constraint(
     script: PipTestEnvironment, data: TestData
@@ -140,6 +143,7 @@ def test_install_requested_from_cli_with_url_constraint(
     )
     result = script.pip(
         "install",
+        "--no-build-isolation",
         "--no-index",
         "-c",
         script.scratch_path / "constraints.txt",

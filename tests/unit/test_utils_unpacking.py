@@ -8,12 +8,18 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import List, Tuple
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 from pip._internal.exceptions import InstallationError
-from pip._internal.utils.unpacking import is_within_directory, untar_file, unzip_file
+from pip._internal.utils.unpacking import (
+    _get_default_mode_plus_executable,
+    is_within_directory,
+    untar_file,
+    unzip_file,
+)
+
 from tests.lib import TestData
 
 
@@ -41,6 +47,9 @@ class TestUnpackArchives:
         self.tempdir = tempfile.mkdtemp()
         self.old_mask = os.umask(0o022)
         self.symlink_expected_mode = None
+        self.default_file_mode = self._probe_created_file_mode()
+        self.default_dir_mode = self._probe_created_dir_mode()
+        self.executable_mode = _get_default_mode_plus_executable()
 
     def teardown_method(self) -> None:
         os.umask(self.old_mask)
@@ -49,18 +58,40 @@ class TestUnpackArchives:
     def mode(self, path: str) -> int:
         return stat.S_IMODE(os.stat(path).st_mode)
 
+    def _probe_created_file_mode(self) -> int:
+        path = os.path.join(self.tempdir, "probe_file_mode")
+        with open(path, "wb"):
+            pass
+        mode = self.mode(path)
+        os.remove(path)
+        return mode
+
+    def _probe_created_dir_mode(self) -> int:
+        path = os.path.join(self.tempdir, "probe_dir_mode")
+        os.mkdir(path)
+        mode = self.mode(path)
+        os.rmdir(path)
+        return mode
+
     def confirm_files(self) -> None:
-        # expectations based on 022 umask set above and the unpack logic that
-        # sets execute permissions, not preservation
+        # expectations based on the unpack logic that writes non-executable
+        # files/dirs with local defaults and sets executables to chmod +x.
+        # Some environments (e.g. with default ACLs) can alter the effective
+        # default mode even with a fixed umask, so probe defaults in tempdir.
         for fname, expected_mode, test, expected_contents in [
-            ("file.txt", 0o644, os.path.isfile, b"file\n"),
+            ("file.txt", self.default_file_mode, os.path.isfile, b"file\n"),
             # We don't test the "symlink.txt" contents for now.
-            ("symlink.txt", 0o644, os.path.isfile, None),
-            ("script_owner.sh", 0o755, os.path.isfile, b"file\n"),
-            ("script_group.sh", 0o755, os.path.isfile, b"file\n"),
-            ("script_world.sh", 0o755, os.path.isfile, b"file\n"),
-            ("dir", 0o755, os.path.isdir, None),
-            (os.path.join("dir", "dirfile"), 0o644, os.path.isfile, b""),
+            ("symlink.txt", self.default_file_mode, os.path.isfile, None),
+            ("script_owner.sh", self.executable_mode, os.path.isfile, b"file\n"),
+            ("script_group.sh", self.executable_mode, os.path.isfile, b"file\n"),
+            ("script_world.sh", self.executable_mode, os.path.isfile, b"file\n"),
+            ("dir", self.default_dir_mode, os.path.isdir, None),
+            (
+                os.path.join("dir", "dirfile"),
+                self.default_file_mode,
+                os.path.isfile,
+                b"",
+            ),
         ]:
             path = os.path.join(self.tempdir, fname)
             if path.endswith("symlink.txt") and sys.platform == "win32":
@@ -73,14 +104,14 @@ class TestUnpackArchives:
                 assert contents == expected_contents, f"fname: {fname}"
             if sys.platform == "win32":
                 # the permissions tests below don't apply in windows
-                # due to os.chmod being a noop
+                # because os.chmod() ignores the execute bit
                 continue
             mode = self.mode(path)
             assert (
                 mode == expected_mode
             ), f"mode: {mode}, expected mode: {expected_mode}"
 
-    def make_zip_file(self, filename: str, file_list: List[str]) -> str:
+    def make_zip_file(self, filename: str, file_list: list[str]) -> str:
         """
         Create a zip file for test case
         """
@@ -90,7 +121,7 @@ class TestUnpackArchives:
                 myzip.writestr(item, "file content")
         return test_zip
 
-    def make_tar_file(self, filename: str, file_list: List[str]) -> str:
+    def make_tar_file(self, filename: str, file_list: list[str]) -> str:
         """
         Create a tar file for test case
         """
@@ -100,6 +131,16 @@ class TestUnpackArchives:
                 file_tarinfo = tarfile.TarInfo(item)
                 mytar.addfile(file_tarinfo, io.BytesIO(b"file content"))
         return test_tar
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="os.chmod() ignores execute bit on Windows"
+    )
+    def test_confirm_files_mode_preconditions(self) -> None:
+        assert self.executable_mode == 0o755
+        assert not (self.default_file_mode & 0o111), (
+            f"default_file_mode {self.default_file_mode:#o} has execute bits set; "
+            "the permission tests in confirm_files() would be meaningless"
+        )
 
     def test_unpack_tgz(self, data: TestData) -> None:
         """
@@ -155,7 +196,13 @@ class TestUnpackArchives:
         test_tar = self.make_tar_file("test_tar.tar", files)
         with pytest.raises(InstallationError) as e:
             untar_file(test_tar, self.tempdir)
-        assert "trying to install outside target directory" in str(e.value)
+
+        # The error message comes from tarfile.data_filter when it is available,
+        # otherwise from pip's own check.
+        if hasattr(tarfile, "data_filter"):
+            assert "is outside the destination" in str(e.value)
+        else:
+            assert "trying to install outside target directory" in str(e.value)
 
     def test_unpack_tar_success(self) -> None:
         """
@@ -170,6 +217,209 @@ class TestUnpackArchives:
         ]
         test_tar = self.make_tar_file("test_tar.tar", files)
         untar_file(test_tar, self.tempdir)
+
+    @pytest.mark.skipif(
+        not hasattr(tarfile, "data_filter"),
+        reason="tarfile filters (PEP-721) not available",
+    )
+    def test_unpack_tar_filter(self) -> None:
+        """
+        Test that the tarfile.data_filter is used to disallow dangerous
+        behaviour (PEP-721)
+        """
+        test_tar = os.path.join(self.tempdir, "test_tar_filter.tar")
+        with tarfile.open(test_tar, "w") as mytar:
+            file_tarinfo = tarfile.TarInfo("bad-link")
+            file_tarinfo.type = tarfile.SYMTYPE
+            file_tarinfo.linkname = "../../../../pwn"
+            mytar.addfile(file_tarinfo, io.BytesIO(b""))
+        with pytest.raises(InstallationError) as e:
+            untar_file(test_tar, self.tempdir)
+
+        assert "is outside the destination" in str(e.value)
+
+    @pytest.mark.parametrize(
+        "input_prefix, unpack_prefix",
+        [
+            ("", ""),
+            ("dir/", ""),  # pip ignores a common leading directory
+            ("dir/sub/", "sub/"),  # pip ignores *one* common leading directory
+        ],
+    )
+    def test_unpack_tar_links(self, input_prefix: str, unpack_prefix: str) -> None:
+        """
+        Test unpacking a *.tar with file containing hard & soft links
+        """
+        test_tar = os.path.join(self.tempdir, "test_tar_links.tar")
+        content = b"file content"
+        with tarfile.open(test_tar, "w") as mytar:
+            file_tarinfo = tarfile.TarInfo(input_prefix + "regular_file.txt")
+            file_tarinfo.size = len(content)
+            mytar.addfile(file_tarinfo, io.BytesIO(content))
+
+            hardlink_tarinfo = tarfile.TarInfo(input_prefix + "hardlink.txt")
+            hardlink_tarinfo.type = tarfile.LNKTYPE
+            hardlink_tarinfo.linkname = input_prefix + "regular_file.txt"
+            mytar.addfile(hardlink_tarinfo)
+
+            symlink_tarinfo = tarfile.TarInfo(input_prefix + "symlink.txt")
+            symlink_tarinfo.type = tarfile.SYMTYPE
+            symlink_tarinfo.linkname = "regular_file.txt"
+            mytar.addfile(symlink_tarinfo)
+
+        untar_file(test_tar, self.tempdir)
+
+        unpack_dir = os.path.join(self.tempdir, unpack_prefix)
+        with open(os.path.join(unpack_dir, "regular_file.txt"), "rb") as f:
+            assert f.read() == content
+
+        with open(os.path.join(unpack_dir, "hardlink.txt"), "rb") as f:
+            assert f.read() == content
+
+        with open(os.path.join(unpack_dir, "symlink.txt"), "rb") as f:
+            assert f.read() == content
+
+    def test_unpack_normal_tar_link1_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a normal tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            file_data = io.BytesIO(b"normal\n")
+            normal_file_tarinfo = tarfile.TarInfo(name="normal_file")
+            normal_file_tarinfo.size = len(file_data.getbuffer())
+            tar.addfile(normal_file_tarinfo, fileobj=file_data)
+
+            info = tarfile.TarInfo("normal_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = "normal_file"
+            tar.addfile(info)
+
+        untar_file(tar_filepath, extract_path)
+
+        assert os.path.islink(os.path.join(extract_path, "normal_symlink"))
+
+        link_path = os.readlink(os.path.join(extract_path, "normal_symlink"))
+        assert link_path == "normal_file"
+
+        with open(os.path.join(extract_path, "normal_symlink"), "rb") as f:
+            assert f.read() == b"normal\n"
+
+    def test_unpack_normal_tar_link2_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a normal tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            file_data = io.BytesIO(b"normal\n")
+            normal_file_tarinfo = tarfile.TarInfo(name="normal_file")
+            normal_file_tarinfo.size = len(file_data.getbuffer())
+            tar.addfile(normal_file_tarinfo, fileobj=file_data)
+
+            info = tarfile.TarInfo("sub/normal_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = ".." + os.path.sep + "normal_file"
+            tar.addfile(info)
+
+        untar_file(tar_filepath, extract_path)
+
+        assert os.path.islink(os.path.join(extract_path, "sub", "normal_symlink"))
+
+        link_path = os.readlink(os.path.join(extract_path, "sub", "normal_symlink"))
+        assert link_path == ".." + os.path.sep + "normal_file"
+
+        with open(os.path.join(extract_path, "sub", "normal_symlink"), "rb") as f:
+            assert f.read() == b"normal\n"
+
+    def test_unpack_evil_tar_link1_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a evil tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        import_filename = "import_file"
+        import_filepath = os.path.join(self.tempdir, import_filename)
+        open(import_filepath, "w").close()
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            info = tarfile.TarInfo("evil_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = import_filepath
+            tar.addfile(info)
+
+        with pytest.raises(InstallationError) as e:
+            untar_file(tar_filepath, extract_path)
+
+        msg = (
+            "The tar file ({}) has a file ({}) trying to install outside "
+            "target directory ({})"
+        )
+        assert msg.format(tar_filepath, "evil_symlink", import_filepath) in str(e.value)
+
+        assert not os.path.exists(os.path.join(extract_path, "evil_symlink"))
+
+    def test_unpack_evil_tar_link2_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a evil tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        import_filename = "import_file"
+        import_filepath = os.path.join(self.tempdir, import_filename)
+        open(import_filepath, "w").close()
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        link_path = ".." + os.sep + import_filename
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            info = tarfile.TarInfo("evil_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = link_path
+            tar.addfile(info)
+
+        with pytest.raises(InstallationError) as e:
+            untar_file(tar_filepath, extract_path)
+
+        msg = (
+            "The tar file ({}) has a file ({}) trying to install outside "
+            "target directory ({})"
+        )
+        assert msg.format(tar_filepath, "evil_symlink", link_path) in str(e.value)
+
+        assert not os.path.exists(os.path.join(extract_path, "evil_symlink"))
 
 
 def test_unpack_tar_unicode(tmpdir: Path) -> None:
@@ -202,8 +452,10 @@ def test_unpack_tar_unicode(tmpdir: Path) -> None:
         (("parent/", "parent/sub"), True),
         # Test target outside parent
         (("parent/", "parent/../sub"), False),
+        # Test target sub-string of parent
+        (("parent/child", "parent/childfoo"), False),
     ],
 )
-def test_is_within_directory(args: Tuple[str, str], expected: bool) -> None:
+def test_is_within_directory(args: tuple[str, str], expected: bool) -> None:
     result = is_within_directory(*args)
     assert result == expected
